@@ -21,9 +21,8 @@ import (
 )
 
 type result struct {
-	revision  string
-	timestamp time.Time
-	sloc      int
+	date     string
+	lines    int
 }
 
 func main() {
@@ -104,7 +103,7 @@ func aggregator(numRevisions int, resultChan <-chan result, wg *sync.WaitGroup) 
 	start := time.Now()
 	histogram := make(map[string]int)
 	processedResults := 0
-		
+
 	for result := range resultChan {
 		processedResults++
 		if processedResults%100 == 0 {
@@ -113,13 +112,12 @@ func aggregator(numRevisions int, resultChan <-chan result, wg *sync.WaitGroup) 
 			log.Printf("%.2f%% done, eta %v", shareDone*100, eta)
 		}
 
-		date := result.timestamp.Format("2006-01-02")
-		if _, ok := histogram[date]; ok {
-			if histogram[date] < result.sloc {
-				histogram[date] = result.sloc
+		if _, ok := histogram[result.date]; ok {
+			if histogram[result.date] < result.lines {
+				histogram[result.date] = result.lines
 			}
 		} else {
-			histogram[date] = result.sloc
+			histogram[result.date] = result.lines
 		}
 	}
 
@@ -135,7 +133,7 @@ func aggregator(numRevisions int, resultChan <-chan result, wg *sync.WaitGroup) 
 		if err != nil {
 			log.Fatalf("unable to parse date: %v", err)
 		}
-		fmt.Printf("%d,%d", ts.Unix(), histogram[date])
+		fmt.Printf("%d,%d\n", ts.Unix(), histogram[date])
 	}
 
 	log.Printf("total time: %v", time.Since(start))
@@ -191,6 +189,17 @@ func getStats(workDir string, revision string) (result, error) {
 	}
 
 	buf.Reset()
+	cmd = exec.Command("git", "log", "-1", "--date=short", "--pretty=format:%cd")
+	cmd.Stdout = &buf
+	cmd.Stderr = os.Stderr
+	cmd.Dir = workDir
+	err = cmd.Run()
+	if err != nil {
+		return result{}, fmt.Errorf("git log failed: %v", err)
+	}
+	date := buf.String()
+
+	buf.Reset()
 	cmd = exec.Command("find", ".", `-type`, `f`, `(`, `-name`, `*.html`, `-o`, `-name`, `*.xml`, `-o`, `-name`, `*.java`, `-o`, `-name`, `*.py`, `)`)
 	cmd.Dir = workDir
 	cmd.Stdout = &buf
@@ -210,7 +219,7 @@ func getStats(workDir string, revision string) (result, error) {
 	}
 
 	if len(args) == 1 {
-		return result{revision: revision}, nil
+		return result{date: date}, nil
 	}
 
 	buf.Reset()
@@ -240,8 +249,8 @@ func getStats(workDir string, revision string) (result, error) {
 	}
 
 	res := result{
-		revision: revision,
-		sloc:     totalLines,
+		date:     date,
+		lines:    totalLines,
 	}
 
 	return res, nil
