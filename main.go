@@ -36,9 +36,6 @@ func main() {
 	}
 	gitDir := flag.Arg(0)
 
-	sigChan := make(chan os.Signal)
-	signal.Notify(sigChan, syscall.SIGINT)
-
 	f, err := os.Create(*cpuprofile)
 	if err != nil {
 		log.Fatal(err)
@@ -52,27 +49,57 @@ func main() {
 	}
 	numRevisions := len(revisions)
 
-	revisionChan := make(chan string, *numWorkers)
-	resultChan := make(chan result, *numWorkers)
+	revisionChan := make(chan string)
+	resultChan := make(chan result)
 
 	log.Printf("Starting workers...")
-	var wg sync.WaitGroup
+	var workerWg sync.WaitGroup
 	for i := 0; i < *numWorkers; i++ {
-		go worker(gitDir, *tmpDir, resultChan, revisionChan, sigChan, wg)
+		workerWg.Add(1)
+		go worker(gitDir, *tmpDir, resultChan, revisionChan, &workerWg)
 	}
 
-	go aggregator(numRevisions, resultChan, sigChan, wg)
+	var wgAggregator sync.WaitGroup
+	wgAggregator.Add(1)
+	go aggregator(numRevisions, resultChan, &wgAggregator)
 
-	for _, revision := range revisions {
-		revisionChan <- revision
-	}
+	sigChan := make(chan os.Signal)
+	signal.Notify(sigChan, syscall.SIGINT)
 
-	wg.Wait()
+	go func() {
+		defer close(revisionChan)
+		defer log.Printf("Shutting down producer")
+
+		i := 0
+		for {
+			select {
+			case sig := <-sigChan:
+				if sig == syscall.SIGINT {
+					log.Printf("SIGINT")
+					return
+				}
+			case revisionChan <- revisions[i]:
+				i++
+				if i == numRevisions {
+					return
+				}
+			}
+		}
+	}()
+
+	workerWg.Wait()
+	log.Printf("All workers done. Closing resultChan.")
+
+	close(resultChan)
+	log.Printf("Waiting for aggregator")
+	wgAggregator.Wait()
 }
 
-func aggregator(numRevisions int, resultChan <-chan result, sigChan chan os.Signal, wg sync.WaitGroup) {
-	wg.Add(1)
+func aggregator(numRevisions int, resultChan <-chan result, wg *sync.WaitGroup) {
 	defer wg.Done()
+	defer log.Printf("Shutting down aggregator")
+
+	log.Printf("Starting aggregator")
 
 	start := time.Now()
 	histogram := make(map[string]int)
@@ -126,14 +153,16 @@ func revisions(gitDir string) ([]string, error) {
 	return strings.Split(buf.String(), "\n"), nil
 }
 
-func worker(gitDir, tmpDir string, resultChan chan result, revisionChan chan string, sigChan chan os.Signal, wg sync.WaitGroup) {
-	wg.Add(1)
+func worker(gitDir, tmpDir string, resultChan chan result, revisionChan chan string, wg *sync.WaitGroup) {
+	defer log.Print("Shutting down worker")
 	defer wg.Done()
+	log.Print("Starting worker")
 
 	for revision := range revisionChan {
 		result, err := processRevision(gitDir, tmpDir, revision)
 		if err != nil {
-			log.Fatalf("processing revision %s failed: %v", revision, err)
+			log.Printf("processing revision %s failed: %v", revision, err)
+			continue
 		}
 		resultChan <- result
 	}
