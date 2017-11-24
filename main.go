@@ -1,7 +1,6 @@
 package main
 
 import (
-	"flag"
 	"log"
 	"os"
 	"os/exec"
@@ -12,38 +11,40 @@ import (
 	"io/ioutil"
 	"path"
 	"fmt"
-	"regexp"
-	"strconv"
 	"sort"
 	"runtime/pprof"
 	"os/signal"
 	"syscall"
+	"path/filepath"
+
+	kingpin "gopkg.in/alecthomas/kingpin.v2"
+	"io"
 )
 
-type revision struct {
-	date     string
-	revision string
-}
-
-type result struct {
-	date     string
-	revision string
-	lines    int
+type commit struct {
+	date  string
+	hash  string
+	lines int
 }
 
 func main() {
-	numWorkers := flag.Int("num-workers", 1, "number of worker goroutines")
-	tmpDir := flag.String("tmp", os.TempDir(), "directory for temporary files")
-	// revisionsFile := flag.String("revisions-cache", "", "file used to read/write information per revision to speed up computation")
-	var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
-	flag.Parse()
-	if flag.NArg() != 1 {
-		log.Fatalf("Usage: %s <path to git dir>", os.Args[0])
+	app := kingpin.New("git-sloc", "Get historic source line counts out of a git repository")
+	gitDir := app.Arg("SRC", "git directory (usually called '.git')").Default(".git").ExistingDir()
+	numWorkers := app.Flag("num-workers", "number of worker goroutines").Default("1").Uint8()
+	tmpDir := app.Flag("tmp", "directory for temporary files").Default(os.TempDir()).String()
+	suffixes := app.Flag("suffixes", "file name suffixes to take into account, eg. '.java'. at least one required").Short('s').Strings()
+	cpuProfile := app.Flag("cpu-profile", "write CPU profile to file").String()
+	_, err := app.Parse(os.Args[1:])
+	if err != nil {
+		log.Fatalf("parsing command line failed: %v", err)
 	}
-	gitDir := flag.Arg(0)
 
-	if len(*cpuprofile) > 0 {
-		f, err := os.Create(*cpuprofile)
+	if len(*suffixes) < 1 {
+		log.Fatalf("at least one suffix required, see --help")
+	}
+
+	if len(*cpuProfile) > 0 {
+		f, err := os.Create(*cpuProfile)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -51,60 +52,62 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	revisions, err := revisions(gitDir)
+	commits, err := revisions(*gitDir)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	numRevisions := len(revisions)
-
-	revisionChan := make(chan revision)
-	resultChan := make(chan result)
+	workerChan := make(chan commit)
+	aggregatorChan := make(chan commit)
 
 	log.Printf("Starting workers...")
 	var workerWg sync.WaitGroup
-	for i := 0; i < *numWorkers; i++ {
+	for i := 0; i < int(*numWorkers); i++ {
 		workerWg.Add(1)
-		go worker(gitDir, *tmpDir, resultChan, revisionChan, &workerWg)
+		go worker(*gitDir, *tmpDir, aggregatorChan, workerChan, &workerWg, *suffixes)
 	}
 
 	var wgAggregator sync.WaitGroup
 	wgAggregator.Add(1)
-	go aggregator(numRevisions, resultChan, &wgAggregator)
+	go aggregator(len(commits), aggregatorChan, &wgAggregator)
 
+	// handle signals
 	sigChan := make(chan os.Signal)
 	signal.Notify(sigChan, syscall.SIGINT)
 
-	go func() {
-		defer close(revisionChan)
-		defer log.Printf("Shutting down producer")
-
-		i := 0
-		for {
-			select {
-			case sig := <-sigChan:
-				if sig == syscall.SIGINT {
-					log.Printf("SIGINT")
-					return
-				}
-			case revisionChan <- revisions[i]:
-				i++
-				if i == numRevisions {
-					return
-				}
-			}
-		}
-	}()
+	// start producer
+	go producer(sigChan, workerChan, commits)
 
 	workerWg.Wait()
-	log.Printf("All workers done. Closing resultChan.")
+	log.Printf("All workers done. Closing aggregatorChan.")
+	close(aggregatorChan)
 
-	close(resultChan)
 	log.Printf("Waiting for aggregator")
 	wgAggregator.Wait()
 }
 
-func aggregator(numRevisions int, resultChan <-chan result, wg *sync.WaitGroup) {
+func producer(sigChan <- chan os.Signal, workerChan chan <- commit, commits []commit) {
+	defer close(workerChan)
+	defer log.Printf("Shutting down producer")
+
+	var i int
+	for {
+		select {
+		case sig := <-sigChan:
+			if sig == syscall.SIGINT {
+				log.Printf("Interrupted, shutting down...")
+				return
+			}
+		case workerChan <- commits[i]:
+			i++
+			if i == len(commits) {
+				return
+			}
+		}
+	}
+}
+
+func aggregator(numCommits int, resultChan <-chan commit, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer log.Printf("Shutting down aggregator")
 
@@ -117,14 +120,12 @@ func aggregator(numRevisions int, resultChan <-chan result, wg *sync.WaitGroup) 
 	for result := range resultChan {
 		processedResults++
 		if processedResults%100 == 0 {
-			shareDone := float64(processedResults) / float64(numRevisions)
+			shareDone := float64(processedResults) / float64(numCommits)
 
 			projectedTotalDuration := time.Duration(float64(time.Since(start).Seconds()) / shareDone) * time.Second
 			eta := projectedTotalDuration - time.Since(start).Round(time.Second)
 			log.Printf("%.2f%% done, eta %v", shareDone*100, eta)
 		}
-
-		// log.Printf("%s: %d", result.revision, result.lines)
 
 		if result.lines == 0 {
 			continue
@@ -153,7 +154,7 @@ func aggregator(numRevisions int, resultChan <-chan result, wg *sync.WaitGroup) 
 	log.Printf("Total time: %v", time.Since(start))
 }
 
-func revisions(gitDir string) ([]revision, error) {
+func revisions(gitDir string) ([]commit, error) {
 	var buf bytes.Buffer
 	cmd := exec.Command("git", "--git-dir="+gitDir, "log", "--pretty=format:%H %cd", "--date=short")
 	cmd.Stdout = &buf
@@ -162,20 +163,20 @@ func revisions(gitDir string) ([]revision, error) {
 		return nil, fmt.Errorf("git log failed: %v", err)
 	}
 
-	var revisions []revision
+	var revisions []commit
 	for _, line := range strings.Split(buf.String(), "\n") {
 		tokens := strings.Split(line, " ")
 		if len(tokens) != 2 {
 			return nil, fmt.Errorf("invalid git log output: %s", line)
 		}
 
-		revisions = append(revisions, revision{revision: tokens[0], date: tokens[1]})
+		revisions = append(revisions, commit{hash: tokens[0], date: tokens[1]})
 	}
 
 	return revisions, nil
 }
 
-func worker(gitDir, tmpDir string, resultChan chan result, revisionChan chan revision, wg *sync.WaitGroup) {
+func worker(gitDir, tmpDir string, aggregatorChan chan commit, workerChan chan commit, wg *sync.WaitGroup, suffixes []string) {
 	defer log.Print("Shutting down worker")
 	defer wg.Done()
 	log.Print("Starting worker")
@@ -184,140 +185,98 @@ func worker(gitDir, tmpDir string, resultChan chan result, revisionChan chan rev
 	if err != nil {
 		log.Fatalf("failed to create work dir: %v", err)
 	}
-	// defer os.RemoveAll(workDir)
+	defer os.RemoveAll(workDir)
 
 	log.Printf("workDir=%s", workDir)
 
-	for revision := range revisionChan {
-		result, err := getStats(workDir, revision)
+	for commit := range workerChan {
+		result, err := getLinesForCommit(workDir, commit, suffixes)
 		if err != nil {
-			log.Printf("processing revision %s failed: %v", revision, err)
+			log.Printf("processing revision %s failed: %v", commit, err)
 			continue
 		}
-		resultChan <- result
+		aggregatorChan <- result
 	}
 }
 
-var wcRegexp = regexp.MustCompile(`^\s+(\d+) total$`)
-
-func getStats(workDir string, revision revision) (result, error) {
-	//filesToDelete, err := filepath.Glob(path.Join(workDir, "*"))
-	//if err != nil {
-	//	return result{}, fmt.Errorf("globbing failed: %v", err)
-	//}
-	//
-	//log.Printf("filesToDelete: %v", filesToDelete)
-	//
-	//for _, toDelete := range filesToDelete {
-	//	// do not delete .git directory ;)
-	//	if strings.Contains(toDelete, ".git") {
-	//		continue
-	//	}
-	//
-	//	err := os.RemoveAll(toDelete)
-	//	if err != nil {
-	//		return result{}, fmt.Errorf("removing %s failed: %v", toDelete, err)
-	//	}
-	//}
-	//
-	//filesInWorkdir, err := filepath.Glob(path.Join(workDir, "*"))
-	//if err != nil {
-	//	return result{}, fmt.Errorf("globbing failed: %v", err)
-	//}
-	//log.Printf("filesInWorkdir: %v", filesInWorkdir)
-
+func getLinesForCommit(workDir string, c commit, suffixes []string) (commit, error) {
 	var buf bytes.Buffer
-	log.Printf("git checkout %s", revision.revision)
-	cmd := exec.Command("git", "checkout", "-f", revision.revision/*, "--", "."*/)
+	cmd := exec.Command("git", "checkout", "-f", c.hash)
 	cmd.Stderr = &buf
 	cmd.Dir = workDir
 	err := cmd.Run()
 	if err != nil {
-		return result{}, fmt.Errorf("git checkout failed: %v, output: %s", err, buf.String())
+		return commit{}, fmt.Errorf("git checkout failed: %v, output: %s", err, buf.String())
 	}
 
-	var allFiles []string
-	dirs := []string{workDir}
-
-	for _, dir := range dirs {
-		files, err := ioutil.ReadDir(dir)
-		if err != nil {
-			return result{}, err
-		}
-
-		for _, f := range files {
-			if f.IsDir() {
-				dirs = append(dirs, path.Join(dir, f.Name()))
-			}
-			name := f.Name()
-			if strings.HasSuffix(name, ".java") || strings.HasSuffix(name, ".xml") || strings.HasSuffix(name, ".html") || strings.HasSuffix(name, ".py") {
-				allFiles = append(allFiles, path.Join(dir, name))
-			}
-		}
-	}
-
-
-
-
-	buf.Reset()
-	cmd = exec.Command("find", ".", `-type`, `f`, `(`, `-name`, `*.html`, `-o`, `-name`, `*.xml`, `-o`, `-name`, `*.java`, `-o`, `-name`, `*.py`, `)`)
-	cmd.Dir = workDir
-	cmd.Stdout = &buf
-	cmd.Stderr = os.Stderr
-	err = cmd.Run()
+	files, err := findFiles(workDir, suffixes)
 	if err != nil {
-		return result{}, fmt.Errorf("find failed: %v", err)
+		return commit{}, fmt.Errorf("failed to find files: %v", err)
 	}
 
-	files := strings.Split(buf.String(), "\n")
+	lines, err := countLines(files)
+	if err != nil {
+		return commit{}, fmt.Errorf("failed to count lines: %v", err)
+	}
+	c.lines = lines
 
-	log.Printf("walker: %d, find: %d", len(allFiles), len(files))
+	return c, nil
+}
 
-	args := []string{"-l"}
+func countLines(files []string) (int, error) {
+	var lines int
 	for _, file := range files {
-		if len(file) > 0 {
-			args = append(args, file)
-		}
-	}
-
-	if len(args) == 1 {
-		return result{revision: revision.revision, date: revision.date}, nil
-	}
-
-	buf.Reset()
-	cmd = exec.Command("wc", args...)
-	cmd.Dir = workDir
-	cmd.Stdout = &buf
-	cmd.Stderr = os.Stderr
-	err = cmd.Run()
-	if err != nil {
-		return result{}, fmt.Errorf("wc failed: %v", err)
-	}
-
-	lineCounts := strings.Split(buf.String(), "\n")
-
-	totalLines := 0
-	for _, lineCount := range lineCounts {
-		matches := wcRegexp.FindStringSubmatch(lineCount)
-		if len(matches) != 2 {
-			continue
-		}
-
-		linesStr := matches[1]
-		lines, err := strconv.Atoi(linesStr)
+		n, err := countLinesForFile(file)
 		if err != nil {
-			return result{}, fmt.Errorf("unable to parse line count: %s", linesStr)
+			return 0, err
 		}
-		totalLines += lines
+		lines += n
 	}
+	return lines, nil
+}
 
-	res := result{
-		date:     revision.date,
-		revision: revision.revision,
-		lines:    totalLines,
+func countLinesForFile(file string) (int, error) {
+	f, err := os.Open(file)
+	if err != nil {
+		return 0, fmt.Errorf("unable to open file: %s: %v", file, err)
 	}
+	defer f.Close()
 
-	return res, nil
+	buf := make([]byte, 1024)
+	var lines int
+	for {
+		n, err := f.Read(buf)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return 0, fmt.Errorf("unable to read file: %s: %v", file, err)
+		}
+
+		for i := 0; i < n; i++ {
+			if buf[i] == '\n' {
+				lines++
+			}
+		}
+	}
+	return lines, nil
+}
+
+func findFiles(dir string, suffixes []string) (files []string, err error) {
+	err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if info.IsDir() {
+			return nil
+		}
+		name := info.Name()
+		for _, suffix := range suffixes {
+			if strings.HasSuffix(name, suffix){
+				files = append(files, path)
+				return nil
+			}
+		}
+		return nil
+	})
+	return
 }
 
 func mkWorkDir(gitDir, tmpDir string) (string, error) {
