@@ -20,14 +20,21 @@ import (
 	"syscall"
 )
 
+type revision struct {
+	date     string
+	revision string
+}
+
 type result struct {
 	date     string
+	revision string
 	lines    int
 }
 
 func main() {
 	numWorkers := flag.Int("num-workers", 1, "number of worker goroutines")
 	tmpDir := flag.String("tmp", os.TempDir(), "directory for temporary files")
+	// revisionsFile := flag.String("revisions-cache", "", "file used to read/write information per revision to speed up computation")
 	var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
 	flag.Parse()
 	if flag.NArg() != 1 {
@@ -35,20 +42,23 @@ func main() {
 	}
 	gitDir := flag.Arg(0)
 
-	f, err := os.Create(*cpuprofile)
-	if err != nil {
-		log.Fatal(err)
+	if len(*cpuprofile) > 0 {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
 	}
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
 
 	revisions, err := revisions(gitDir)
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	numRevisions := len(revisions)
 
-	revisionChan := make(chan string)
+	revisionChan := make(chan revision)
 	resultChan := make(chan result)
 
 	log.Printf("Starting workers...")
@@ -108,8 +118,16 @@ func aggregator(numRevisions int, resultChan <-chan result, wg *sync.WaitGroup) 
 		processedResults++
 		if processedResults%100 == 0 {
 			shareDone := float64(processedResults) / float64(numRevisions)
-			eta := time.Duration(time.Duration(time.Since(start).Seconds()/shareDone) * time.Second)
+
+			projectedTotalDuration := time.Duration(float64(time.Since(start).Seconds()) / shareDone) * time.Second
+			eta := projectedTotalDuration - time.Since(start).Round(time.Second)
 			log.Printf("%.2f%% done, eta %v", shareDone*100, eta)
+		}
+
+		// log.Printf("%s: %d", result.revision, result.lines)
+
+		if result.lines == 0 {
+			continue
 		}
 
 		if _, ok := histogram[result.date]; ok {
@@ -129,35 +147,49 @@ func aggregator(numRevisions int, resultChan <-chan result, wg *sync.WaitGroup) 
 	sort.Strings(dates)
 
 	for _, date := range dates {
-		ts, err := time.Parse("2006-01-02", date)
-		if err != nil {
-			log.Fatalf("unable to parse date: %v", err)
-		}
-		fmt.Printf("%d,%d\n", ts.Unix(), histogram[date])
+		fmt.Printf("%s %d\n", date, histogram[date])
 	}
 
-	log.Printf("total time: %v", time.Since(start))
+	log.Printf("Total time: %v", time.Since(start))
 }
 
-func revisions(gitDir string) ([]string, error) {
+func revisions(gitDir string) ([]revision, error) {
 	var buf bytes.Buffer
-	cmd := exec.Command("git", "--git-dir="+gitDir, "log", "--pretty=format:%H")
+	cmd := exec.Command("git", "--git-dir="+gitDir, "log", "--pretty=format:%H %cd", "--date=short")
 	cmd.Stdout = &buf
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("git log failed: %v", err)
 	}
 
-	return strings.Split(buf.String(), "\n"), nil
+	var revisions []revision
+	for _, line := range strings.Split(buf.String(), "\n") {
+		tokens := strings.Split(line, " ")
+		if len(tokens) != 2 {
+			return nil, fmt.Errorf("invalid git log output: %s", line)
+		}
+
+		revisions = append(revisions, revision{revision: tokens[0], date: tokens[1]})
+	}
+
+	return revisions, nil
 }
 
-func worker(gitDir, tmpDir string, resultChan chan result, revisionChan chan string, wg *sync.WaitGroup) {
+func worker(gitDir, tmpDir string, resultChan chan result, revisionChan chan revision, wg *sync.WaitGroup) {
 	defer log.Print("Shutting down worker")
 	defer wg.Done()
 	log.Print("Starting worker")
 
+	workDir, err := mkWorkDir(gitDir, tmpDir)
+	if err != nil {
+		log.Fatalf("failed to create work dir: %v", err)
+	}
+	// defer os.RemoveAll(workDir)
+
+	log.Printf("workDir=%s", workDir)
+
 	for revision := range revisionChan {
-		result, err := processRevision(gitDir, tmpDir, revision)
+		result, err := getStats(workDir, revision)
 		if err != nil {
 			log.Printf("processing revision %s failed: %v", revision, err)
 			continue
@@ -166,21 +198,37 @@ func worker(gitDir, tmpDir string, resultChan chan result, revisionChan chan str
 	}
 }
 
-func processRevision(gitDir, tmpDir string, revision string) (result, error) {
-	workDir, err := mkWorkDir(gitDir, tmpDir)
-	if err != nil {
-		return result{}, err
-	}
-	defer os.RemoveAll(workDir)
-
-	return getStats(workDir, revision)
-}
-
 var wcRegexp = regexp.MustCompile(`^\s+(\d+) total$`)
 
-func getStats(workDir string, revision string) (result, error) {
+func getStats(workDir string, revision revision) (result, error) {
+	//filesToDelete, err := filepath.Glob(path.Join(workDir, "*"))
+	//if err != nil {
+	//	return result{}, fmt.Errorf("globbing failed: %v", err)
+	//}
+	//
+	//log.Printf("filesToDelete: %v", filesToDelete)
+	//
+	//for _, toDelete := range filesToDelete {
+	//	// do not delete .git directory ;)
+	//	if strings.Contains(toDelete, ".git") {
+	//		continue
+	//	}
+	//
+	//	err := os.RemoveAll(toDelete)
+	//	if err != nil {
+	//		return result{}, fmt.Errorf("removing %s failed: %v", toDelete, err)
+	//	}
+	//}
+	//
+	//filesInWorkdir, err := filepath.Glob(path.Join(workDir, "*"))
+	//if err != nil {
+	//	return result{}, fmt.Errorf("globbing failed: %v", err)
+	//}
+	//log.Printf("filesInWorkdir: %v", filesInWorkdir)
+
 	var buf bytes.Buffer
-	cmd := exec.Command("git", "checkout", revision)
+	log.Printf("git checkout %s", revision.revision)
+	cmd := exec.Command("git", "checkout", "-f", revision.revision/*, "--", "."*/)
 	cmd.Stderr = &buf
 	cmd.Dir = workDir
 	err := cmd.Run()
@@ -188,16 +236,28 @@ func getStats(workDir string, revision string) (result, error) {
 		return result{}, fmt.Errorf("git checkout failed: %v, output: %s", err, buf.String())
 	}
 
-	buf.Reset()
-	cmd = exec.Command("git", "log", "-1", "--date=short", "--pretty=format:%cd")
-	cmd.Stdout = &buf
-	cmd.Stderr = os.Stderr
-	cmd.Dir = workDir
-	err = cmd.Run()
-	if err != nil {
-		return result{}, fmt.Errorf("git log failed: %v", err)
+	var allFiles []string
+	dirs := []string{workDir}
+
+	for _, dir := range dirs {
+		files, err := ioutil.ReadDir(dir)
+		if err != nil {
+			return result{}, err
+		}
+
+		for _, f := range files {
+			if f.IsDir() {
+				dirs = append(dirs, path.Join(dir, f.Name()))
+			}
+			name := f.Name()
+			if strings.HasSuffix(name, ".java") || strings.HasSuffix(name, ".xml") || strings.HasSuffix(name, ".html") || strings.HasSuffix(name, ".py") {
+				allFiles = append(allFiles, path.Join(dir, name))
+			}
+		}
 	}
-	date := buf.String()
+
+
+
 
 	buf.Reset()
 	cmd = exec.Command("find", ".", `-type`, `f`, `(`, `-name`, `*.html`, `-o`, `-name`, `*.xml`, `-o`, `-name`, `*.java`, `-o`, `-name`, `*.py`, `)`)
@@ -211,6 +271,8 @@ func getStats(workDir string, revision string) (result, error) {
 
 	files := strings.Split(buf.String(), "\n")
 
+	log.Printf("walker: %d, find: %d", len(allFiles), len(files))
+
 	args := []string{"-l"}
 	for _, file := range files {
 		if len(file) > 0 {
@@ -219,7 +281,7 @@ func getStats(workDir string, revision string) (result, error) {
 	}
 
 	if len(args) == 1 {
-		return result{date: date}, nil
+		return result{revision: revision.revision, date: revision.date}, nil
 	}
 
 	buf.Reset()
@@ -233,6 +295,7 @@ func getStats(workDir string, revision string) (result, error) {
 	}
 
 	lineCounts := strings.Split(buf.String(), "\n")
+
 	totalLines := 0
 	for _, lineCount := range lineCounts {
 		matches := wcRegexp.FindStringSubmatch(lineCount)
@@ -249,7 +312,8 @@ func getStats(workDir string, revision string) (result, error) {
 	}
 
 	res := result{
-		date:     date,
+		date:     revision.date,
+		revision: revision.revision,
 		lines:    totalLines,
 	}
 
@@ -262,6 +326,7 @@ func mkWorkDir(gitDir, tmpDir string) (string, error) {
 		return "", fmt.Errorf("unable to create temp dir: %v", err)
 	}
 
+	// do not rsync the objects folder as it is very large
 	cmd := exec.Command("rsync", "-a", "--exclude=objects", gitDir+"/", dir+"/.git/")
 	cmd.Stderr = os.Stderr
 	err = cmd.Run()
@@ -269,6 +334,7 @@ func mkWorkDir(gitDir, tmpDir string) (string, error) {
 		return "", fmt.Errorf("rsync failed: %v", err)
 	}
 
+	// link the objects folder instead
 	cmd = exec.Command("ln", "-s", path.Join(gitDir, "objects"), path.Join(dir, ".git", "objects"))
 	cmd.Stderr = os.Stderr
 	err = cmd.Run()
