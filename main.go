@@ -72,7 +72,7 @@ func main() {
 	go aggregator(len(commits), aggregatorChan, &wgAggregator)
 
 	// handle signals
-	sigChan := make(chan os.Signal)
+	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT)
 
 	// start producer
